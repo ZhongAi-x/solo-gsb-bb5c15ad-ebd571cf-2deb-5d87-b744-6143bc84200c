@@ -17,7 +17,7 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmp, "reservations.db")
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
-from app import db, rdp  # noqa: E402
+from app import db, ledger, rdp  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -732,6 +732,102 @@ async def test_direct_requests_race_with_reservations_within_cap(client):
     committed = _committed_epsilon(active + requests_rows, cap_delta)
     assert committed <= cap_eps + 1e-12
     assert budget["active_reservations"] == len(active)
+
+
+# --------------------------------------- TTL race while queued on write lock --
+
+
+@pytest.mark.asyncio
+async def test_confirm_expiring_during_lock_queue_is_rejected_not_confirmed(client):
+    """TTL judgment must use the in-transaction instant, not a pre-queue one.
+
+    The confirm request is parked on the process write lock while the
+    reservation's expiry instant moves into the past; only then is the lock
+    released.  The confirm must 409 with reservation_expired and must not mint
+    a permanent granted request.
+    """
+    ds = _new_dataset_id("concconfirmttl")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.1, ttl=600)
+    )
+    payload = {"request_id": "req-1", "query_type": "q"}
+
+    lock = ledger._write_lock()
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(
+            client.post(
+                f"/datasets/{ds}/reservations/rv/confirm", json=payload
+            )
+        )
+        # Let the request reach (and park on) the write-lock queue.
+        await asyncio.sleep(0.1)
+        # TTL now elapses while the confirm is still queued: the expiry is a
+        # little in the future relative to the queued request's entry time,
+        # but well in the past by the time the transaction will begin.
+        await _backdate(
+            client, ds, "rv",
+            datetime.now(timezone.utc) + timedelta(milliseconds=200),
+        )
+        await asyncio.sleep(0.4)
+    finally:
+        lock.release()
+
+    r = await task
+    assert r.status_code == 409
+    assert r.json()["error"] == "reservation_expired"
+
+    # No permanent request was minted by the failed confirmation.
+    assert (await client.get(f"/datasets/{ds}/requests")).json()["count"] == 0
+    # A retry with the same payload is a state conflict too (no idempotent
+    # verdict exists to replay): the reservation is expired.
+    again = await client.post(
+        f"/datasets/{ds}/reservations/rv/confirm", json=payload
+    )
+    assert again.status_code == 409
+    assert again.json()["error"] == "reservation_expired"
+    assert (await client.get(f"/datasets/{ds}/requests")).json()["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_confirm_queued_within_ttl_keeps_original_budget_accounting(client):
+    """A reservation still valid when the transaction begins confirms normally."""
+    ds = _new_dataset_id("concconfirmok")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    rv = await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.2, ttl=600)
+    )
+    committed_before = rv.json()["epsilon_after"]
+    payload = {"request_id": "req-1", "query_type": "q"}
+
+    lock = ledger._write_lock()
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(
+            client.post(
+                f"/datasets/{ds}/reservations/rv/confirm", json=payload
+            )
+        )
+        await asyncio.sleep(0.1)
+        # The expiry stays in the future throughout the whole queue wait.
+        await _backdate(
+            client, ds, "rv",
+            datetime.now(timezone.utc) + timedelta(seconds=60),
+        )
+    finally:
+        lock.release()
+
+    r = await task
+    assert r.status_code == 201
+    body = r.json()
+    assert body["allowed"] is True
+    assert body["idempotent_replay"] is False
+    # Original budget accounting is unchanged: no double charge.
+    assert body["epsilon_after"] == pytest.approx(committed_before, abs=1e-9)
+    budget = (await client.get(f"/datasets/{ds}/budget")).json()
+    assert budget["granted_requests"] == 1
+    assert budget["active_reservations"] == 0
 
 
 # ------------------------------------------------------------- migration --

@@ -859,12 +859,23 @@ async def confirm_reservation(
     The reserved (epsilon, delta) becomes a granted request with the client
     supplied ``request_id`` / ``query_type``; the locked budget is not charged
     twice (the reservation leaves the active set as soon as it is confirmed).
-    """
-    now_iso = utcnow().isoformat()
 
+    The single UTC decision instant is captured only after ``BEGIN IMMEDIATE``
+    has been acquired, never while this request is still queued on the write
+    lock.  A short-TTL reservation that expires during the queue wait is
+    therefore judged (and lazily swept) against the in-transaction instant and
+    rejected with the existing ``reservation_expired`` 409 instead of minting
+    a permanent request.  Same-payload replays of an earlier confirmation are
+    unaffected: a confirmed reservation is never re-judged against its TTL.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # One decision instant for the whole transaction, captured after
+            # the write lock + BEGIN IMMEDIATE are held: an expiry that falls
+            # while this request queues must count, so TTL validity, the lazy
+            # sweep and all stored timestamps share this single fresh instant.
+            now_iso = utcnow().isoformat()
             try:
                 dataset = await db.require_dataset(conn, dataset_id)
                 row = await db.get_reservation(conn, dataset_id, reservation_id)
@@ -1046,12 +1057,23 @@ async def renew_reservation(
     returns the stored before/after expiry instants (HTTP 200) -- even if the
     reservation has since expired; a different payload on that id is a 409,
     as is a *new* renewal on an expired or terminal reservation.
-    """
-    now_iso = utcnow().isoformat()
 
+    The single UTC decision instant is captured only after ``BEGIN IMMEDIATE``
+    has been acquired, never while this request is still queued on the write
+    lock: a short-TTL reservation whose expiry falls during the queue wait is
+    lazily swept inside the transaction and the renewal is rejected with the
+    existing ``reservation_expired`` 409, leaving no renewal record and no
+    ``expires_at`` change.  Same-payload replays of an earlier renewal are
+    looked up first and replayed regardless of the reservation's current TTL.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # One decision instant for the whole transaction, captured after
+            # the write lock + BEGIN IMMEDIATE are held: an expiry that falls
+            # while this request queues must count, so TTL validity, the lazy
+            # sweep and the renewal record's created_at share this one instant.
+            now_iso = utcnow().isoformat()
             try:
                 await db.require_dataset(conn, dataset_id)
 

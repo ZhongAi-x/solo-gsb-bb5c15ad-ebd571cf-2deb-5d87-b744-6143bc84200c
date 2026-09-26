@@ -573,6 +573,10 @@ curl -X POST \
 
 * 预算**不重复扣减**：确认前由预留锁定的组合消耗，确认后改由该申请承载，
   `epsilon_after` 保持不变；
+* 是否过期按**进入写事务后**（获得写锁与 `BEGIN IMMEDIATE` 之后）捕获的
+  同一 UTC 判定时刻衡量：确认请求在写锁排队期间若 TTL 到期，进入事务时
+  会先按该时刻把预留惰性清扫为 `expired` 并返回
+  `409 reservation_expired`，**不会**生成永久申请；
 * 确认必须在预留处于 `granted` 且未过期时进行；
   `released` / `expired` / `rejected` → `409`（错误码分别为
   `reservation_released` / `reservation_expired` /
@@ -644,6 +648,10 @@ curl -X POST \
   `reservation_confirmed` / `reservation_released` / `reservation_rejected` /
   `reservation_expired`）；预留不存在 → `404 reservation_not_found`，
   数据集不存在 → `404 dataset_not_found`；
+* 是否过期同样按**进入写事务后**（获得写锁与 `BEGIN IMMEDIATE` 之后）
+  捕获的同一 UTC 判定时刻衡量：续期请求在写锁排队期间若 TTL 到期，
+  进入事务时按该时刻惰性清扫并返回 `409 reservation_expired`，
+  **不后移到期时刻、不写续期记录**；
 * 相同 `(dataset_id, renewal_id)` + **相同负载**（同一 `reservation_id` 与
   `extend_seconds`）重试：返回 `200` 与**首次续期记录**的前后到期时刻，
   `idempotent_replay=true`，到期时刻只后移一次——即使预留此后已过期也照样
@@ -741,6 +749,11 @@ curl -X POST \
   申请或预留、确认、释放、续期、调整）都会在同一临界区内把 `expires_at ≤ now` 的
   `granted` 预留惰性标记为 `expired`（记录 `expired_at`），之后它们**不再
   占用额度**——因此过期后新的申请/预留可以使用这部分额度；
+* 确认与续期这两条写路径的「现在」一律在**进入写事务后**（获得写锁与
+  `BEGIN IMMEDIATE` 之后）捕获，且整笔事务共用这同一个 UTC 判定时刻：
+  请求在写锁排队期间跨过到期点的短 TTL 预留按已过期处理
+  （`409 reservation_expired`），不会把排队前取到的旧时刻当作判定依据而
+  确认出永久申请或写入续期记录；
 * 过期是终态：过期预留不能再确认（`409 reservation_expired`），对其调用
   release 返回幂等结果；
 * `GET …/reservations` 返回全部预留及各自的 `status` 与
@@ -1512,12 +1525,16 @@ EPSILON_TOLERANCE` 的子集为可行。在全部可行子集中按以下顺序�
   （两个 cap 不变，仅留一条 rejected 记录），并发转拨与普通申请 / 预留
   交错也不会使来源预算透支；
 * 预留的确认同样在该临界区内完成「插入 granted 申请 + 预留置
-  confirmed」，两步原子，预算不可能被扣两次；
+  confirmed」，两步原子，预算不可能被扣两次；确认用的 UTC 判定时刻在
+  **进入该临界区后**才捕获，因此在写锁排队期间 TTL 到期的预留会先被
+  惰性清扫、确认以 `409 reservation_expired` 拒绝，不会生成永久申请；
 * 预留的续期在该临界区内一次完成「`renewal_id` 查重 → 惰性过期清扫与
   状态校验 → 90 天视野校验 → 更新 `expires_at` → 写入不可变
   reservation_renewals 记录」：续期与确认 / 释放 / 过期清扫并发交错时，
   到期时刻的移动与状态判定始终一致，同一 `(dataset_id, renewal_id)` 最多
-  生效一次（`UNIQUE` 约束兜底），续期本身不重算组合、不重复占额；
+  生效一次（`UNIQUE` 约束兜底），续期本身不重算组合、不重复占额；其 UTC
+  判定时刻同样在**进入该临界区后**捕获，写锁排队期间到期的预留不会留下
+  续期记录、到期时刻也不后移；
 * SQLite 启用 **WAL** 与 `busy_timeout`：读不阻塞写，写冲突排队等待
   而非立即报错；`(dataset_id, request_id)`、`(dataset_id, reservation_id)`、
   `(dataset_id, batch_id)` 与 `(dataset_id, renewal_id)` 上各有 `UNIQUE`
@@ -1674,18 +1691,22 @@ RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409�
 预留相关测试另覆盖：预留锁定/拒绝、预算视图、创建幂等与三种负载冲突
 409、确认转申请且不双重扣减、确认幂等/冲突/终态 409、释放幂等与终态
 409、TTL 过期在查询与新建时释放额度、60 路并发预留不超预算、15 路并发
-确认仅一条申请、预留/确认/释放/直接申请混合并发下始终不超 cap，以及
-从 v1 schema 启动时的自动迁移。
+确认仅一条申请、确认请求在写锁排队期间 TTL 到期时按**进入写事务后**的
+判定时刻返回 `409 reservation_expired` 且不生成申请（排队期间仍有效则
+按原口径确认、不重复扣额）、预留/确认/释放/直接申请混合并发下始终不超
+cap，以及从 v1 schema 启动时的自动迁移。
 
 续期相关测试另覆盖：到期时刻按 `extend_seconds` 后移且金额 / 原始
 `ttl_seconds` 不变、不重复占额，多次续期链式后移，同负载重放返回首次前后
 到期时刻（含预留已过期后的重放）且只后移一次、异负载 / 跨预留同键 409、
 `renewal_id` 按数据集隔离、缺失数据集 / 预留 404、confirmed / released /
-rejected / expired 终态 409、90 天视野上限（恰好到界通过、超一秒 409 且
-到期时刻不变）、负载非法 422、确认与只读释放预测按新到期时刻工作、续期后
-的预留仍在新到期时刻才被惰性清扫、20 路重复 `renewal_id` 并发仅后移一次、
-10 路不同 `renewal_id` 并发全部生效，以及从 v5 schema 启动时自动迁移出
-`reservation_renewals` 表。
+rejected / expired 终态 409、续期请求在写锁排队期间 TTL 到期时按**进入
+写事务后**的判定时刻返回 `409 reservation_expired`、不写续期记录且到期
+时刻不变（排队期间仍有效则正常后移）、90 天视野上限（恰好到界通过、超
+一秒 409 且到期时刻不变）、负载非法 422、确认与只读释放预测按新到期
+时刻工作、续期后的预留仍在新到期时刻才被惰性清扫、20 路重复
+`renewal_id` 并发仅后移一次、10 路不同 `renewal_id` 并发全部生效，以及
+从 v5 schema 启动时自动迁移出 `reservation_renewals` 表。
 
 预留额度调整测试另覆盖：在 cap 内调大 / 调小 / 改 delta（含纯 ε ↔ 近似 DP）
 后预算视图按新额度核算（并用 `rdp.py` 独立组合交叉校验）、调小释放的额度可被

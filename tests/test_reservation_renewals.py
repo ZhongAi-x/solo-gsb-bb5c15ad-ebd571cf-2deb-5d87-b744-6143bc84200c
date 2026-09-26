@@ -17,7 +17,7 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmp, "renewals.db")
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
-from app import db  # noqa: E402
+from app import db, ledger  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 from app.schemas import MAX_TTL_SECONDS  # noqa: E402
@@ -579,6 +579,107 @@ async def test_concurrent_distinct_renewals_all_apply(client):
             assert row is not None
             count += 1
         assert count == n
+
+
+# --------------------------------------- TTL race while queued on write lock --
+
+
+@pytest.mark.asyncio
+async def test_renewal_expiring_during_lock_queue_is_rejected_not_recorded(client):
+    """TTL judgment must use the in-transaction instant, not a pre-queue one.
+
+    The renewal request is parked on the process write lock while the
+    reservation's expiry instant moves into the past; only then is the lock
+    released.  The renewal must 409 with reservation_expired, must not extend
+    the expiry and must leave no renewal record.
+    """
+    ds = _new_dataset_id("concrenewttl")
+    await _register(client, ds)
+    await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.1, ttl=600)
+    )
+    created = (await client.get(f"/datasets/{ds}/reservations/rv")).json()
+    original_expiry = _ts(created["expires_at"])
+
+    lock = ledger._write_lock()
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(
+            client.post(
+                f"/datasets/{ds}/reservations/rv/renewals",
+                json=_ren("ren-1", 300),
+            )
+        )
+        # Let the request reach (and park on) the write-lock queue.
+        await asyncio.sleep(0.1)
+        # TTL now elapses while the renewal is still queued: the expiry is a
+        # little in the future relative to the queued request's entry time,
+        # but well in the past by the time the transaction will begin.
+        expired_point = datetime.now(timezone.utc) + timedelta(milliseconds=200)
+        await _backdate(ds, "rv", expired_point)
+        await asyncio.sleep(0.4)
+    finally:
+        lock.release()
+
+    r = await task
+    assert r.status_code == 409
+    assert r.json()["error"] == "reservation_expired"
+
+    # No renewal record exists and the expiry was never moved forward.
+    async with db.connect() as conn:
+        assert await db.get_reservation_renewal(conn, ds, "ren-1") is None
+    got = (await client.get(f"/datasets/{ds}/reservations/rv")).json()
+    assert got["status"] == "expired"
+    assert _ts(got["expires_at"]) == expired_point
+    assert original_expiry > expired_point
+
+    # A retry with the same payload is a state conflict too (no idempotent
+    # record exists to replay): the reservation is expired.
+    again = await client.post(
+        f"/datasets/{ds}/reservations/rv/renewals", json=_ren("ren-1", 300)
+    )
+    assert again.status_code == 409
+    assert again.json()["error"] == "reservation_expired"
+    async with db.connect() as conn:
+        assert await db.get_reservation_renewal(conn, ds, "ren-1") is None
+
+
+@pytest.mark.asyncio
+async def test_renewal_queued_within_ttl_still_extends(client):
+    """A reservation still valid when the transaction begins renews normally."""
+    ds = _new_dataset_id("concrenewok")
+    await _register(client, ds)
+    await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", ttl=600)
+    )
+
+    lock = ledger._write_lock()
+    await lock.acquire()
+    try:
+        task = asyncio.create_task(
+            client.post(
+                f"/datasets/{ds}/reservations/rv/renewals",
+                json=_ren("ren-1", 300),
+            )
+        )
+        await asyncio.sleep(0.1)
+        # The expiry stays in the future throughout the whole queue wait.
+        await _backdate(
+            ds, "rv", datetime.now(timezone.utc) + timedelta(seconds=60)
+        )
+    finally:
+        lock.release()
+
+    r = await task
+    assert r.status_code == 201
+    body = r.json()
+    assert body["idempotent_replay"] is False
+    before = _ts(body["expires_at_before"])
+    after = _ts(body["expires_at_after"])
+    assert after - before == timedelta(seconds=300)
+    got = (await client.get(f"/datasets/{ds}/reservations/rv")).json()
+    assert got["status"] == "granted"
+    assert _ts(got["expires_at"]) == after
 
 
 # ------------------------------------------------------------- migration --
