@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import os
+import sqlite3
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -17,7 +20,7 @@ os.environ["DATABASE_PATH"] = os.path.join(_tmp, "reservations.db")
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
-from app import db, rdp  # noqa: E402
+from app import db, ledger, rdp  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -67,6 +70,54 @@ async def _backdate(client_unused, dataset_id: str, reservation_id: str,
             expires_at=expires_at.isoformat(),
         )
         await conn.commit()
+
+
+@contextlib.asynccontextmanager
+async def _external_write_tx(dataset_id: str, reservation_id: str,
+                             expired_at: datetime):
+    """Hold the SQLite write lock from another connection/thread and backdate.
+
+    A background thread opens its own connection to the same database file and
+    runs ``BEGIN IMMEDIATE``, so the app's next writer queues on SQLite's write
+    lock exactly as it would behind another process.  While the lock is held,
+    the reservation's ``expires_at`` is moved into the past; the queued app
+    transaction only acquires the lock after the external one commits, when
+    the yielded ``holding`` event has been cleared.  A clock patched to
+    report the reservation's creation instant *while that event is set* (and
+    the real current time afterwards) reproduces the TTL queueing race
+    deterministically without real sleeping: code that samples ``now``
+    before acquiring its write transaction sees a still-valid reservation;
+    code that samples afterwards sees it expired.
+    """
+    held = threading.Event()
+    holding = threading.Event()
+    gate = threading.Event()
+
+    def _writer() -> None:
+        conn = sqlite3.connect(settings.db_path, timeout=15)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE reservations SET expires_at = ? "
+                "WHERE dataset_id = ? AND reservation_id = ?",
+                (expired_at.isoformat(), dataset_id, reservation_id),
+            )
+            holding.set()
+            held.set()
+            gate.wait(timeout=15)
+            conn.commit()
+        finally:
+            holding.clear()
+            conn.close()
+
+    thread = threading.Thread(target=_writer)
+    thread.start()
+    held.wait(timeout=15)
+    try:
+        yield holding
+    finally:
+        gate.set()
+        thread.join()
 
 
 # ------------------------------------------------------------- create flows --
@@ -402,6 +453,58 @@ async def test_confirm_replay_with_different_payload_conflicts(client):
         json={"request_id": "req-2", "query_type": "q2"},
     )
     assert other.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_confirm_expired_while_queued_on_write_lock_returns_409(
+    client, monkeypatch
+):
+    """TTL is judged at the instant the write transaction actually starts.
+
+    Regression: confirm used to sample ``now`` before entering its write
+    transaction.  When the call queued behind another writer past the
+    reservation's expiry, it still confirmed the dead reservation into a
+    permanent granted request.
+    """
+    ds = _new_dataset_id("queuexpire")
+    await _register(client, ds, eps=1.0, delta=1e-6)
+    created = (await client.post(
+        f"/datasets/{ds}/reservations", json=_res("rv", epsilon=0.1, ttl=600)
+    )).json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    # Backdated expiry; the queued-window instant is even earlier, so a stale
+    # pre-transaction sample still sees the reservation as valid, while real
+    # time (after the lock is acquired) is well past the expiry.
+    past = created_at - timedelta(seconds=10)
+    queued = created_at - timedelta(seconds=20)
+
+    real_utcnow = ledger.utcnow
+    async with _external_write_tx(ds, "rv", past) as holding:
+        # While the external writer holds the SQLite lock, a pre-transaction
+        # sample (the buggy order) must still see the reservation as within
+        # its TTL; once our transaction starts the real current time is past
+        # the backdated expiry.
+        def _clock():
+            if holding.is_set():
+                return queued
+            return real_utcnow()
+
+        monkeypatch.setattr(ledger, "utcnow", _clock)
+        parked = asyncio.create_task(client.post(
+            f"/datasets/{ds}/reservations/rv/confirm",
+            json={"request_id": "req-late", "query_type": "q"},
+        ))
+        # Let the parked request enter the write lock and block on SQLite.
+        await asyncio.sleep(0.1)
+    response = await parked
+
+    assert response.status_code == 409
+    assert response.json()["error"] == "reservation_expired"
+    # No request record was created for the expired reservation.
+    assert (await client.get(f"/datasets/{ds}/requests")).json()["count"] == 0
+    got = (await client.get(f"/datasets/{ds}/reservations/rv")).json()
+    assert got["status"] == "expired"
+    assert got["confirmed_request_id"] is None
 
 
 @pytest.mark.asyncio

@@ -573,7 +573,10 @@ curl -X POST \
 
 * 预算**不重复扣减**：确认前由预留锁定的组合消耗，确认后改由该申请承载，
   `epsilon_after` 保持不变；
-* 确认必须在预留处于 `granted` 且未过期时进行；
+* 确认必须在预留处于 `granted` 且未过期时进行。预留是否过期只在确认请求
+  **取得写锁（`BEGIN IMMEDIATE`）之后**按同一个 UTC 时刻判定并在同一事务内
+  惰性刷新：即使该请求在写锁队列中等待到超过到期点，也不会再生成永久申请，
+  而是返回 `409 reservation_expired`、不创建任何 `requests` 记录；
   `released` / `expired` / `rejected` → `409`（错误码分别为
   `reservation_released` / `reservation_expired` /
   `reservation_rejected`）；预留不存在 → `404 reservation_not_found`；
@@ -642,8 +645,11 @@ curl -X POST \
 * 已到期（含被惰性清扫）或终态（`confirmed` / `released` / `rejected` /
   `expired`）的预留**不能续期** → `409`（错误码分别为
   `reservation_confirmed` / `reservation_released` / `reservation_rejected` /
-  `reservation_expired`）；预留不存在 → `404 reservation_not_found`，
-  数据集不存在 → `404 dataset_not_found`；
+  `reservation_expired`）；预留是否过期只在续期请求**取得写锁
+  （`BEGIN IMMEDIATE`）之后**按同一个 UTC 时刻判定并在同一事务内惰性刷新：
+  即使该请求在写锁队列中等待到超过到期点，也不会记录成功续期或后移
+  `expires_at`，而是返回 `409 reservation_expired`、不写入续期记录；预留不
+  存在 → `404 reservation_not_found`，数据集不存在 → `404 dataset_not_found`；
 * 相同 `(dataset_id, renewal_id)` + **相同负载**（同一 `reservation_id` 与
   `extend_seconds`）重试：返回 `200` 与**首次续期记录**的前后到期时刻，
   `idempotent_replay=true`，到期时刻只后移一次——即使预留此后已过期也照样

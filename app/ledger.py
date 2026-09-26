@@ -859,12 +859,22 @@ async def confirm_reservation(
     The reserved (epsilon, delta) becomes a granted request with the client
     supplied ``request_id`` / ``query_type``; the locked budget is not charged
     twice (the reservation leaves the active set as soon as it is confirmed).
-    """
-    now_iso = utcnow().isoformat()
 
+    The single UTC validity instant is captured only *after* ``BEGIN
+    IMMEDIATE`` has been acquired, i.e. after this call has passed the
+    process write lock and the SQLite write-lock queue.  A short-lived
+    reservation whose TTL elapses while this confirmation is queued behind
+    another writer is therefore judged at the later instant: it is lazily
+    expired and rejected with ``409 reservation_expired`` inside the same
+    transaction, so no request row is ever created for an already-expired
+    reservation.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # Judge TTL against the instant the write transaction actually
+            # starts, never an instant sampled before lock queueing.
+            now_iso = utcnow().isoformat()
             try:
                 dataset = await db.require_dataset(conn, dataset_id)
                 row = await db.get_reservation(conn, dataset_id, reservation_id)
@@ -1046,12 +1056,22 @@ async def renew_reservation(
     returns the stored before/after expiry instants (HTTP 200) -- even if the
     reservation has since expired; a different payload on that id is a 409,
     as is a *new* renewal on an expired or terminal reservation.
-    """
-    now_iso = utcnow().isoformat()
 
+    The single UTC validity instant is captured only *after* ``BEGIN
+    IMMEDIATE`` has been acquired, i.e. after this call has passed both the
+    process write lock and the SQLite write-lock queue.  A reservation whose
+    TTL elapses while this renewal is queued behind another writer is judged
+    at that later instant: it is lazily expired and rejected with
+    ``409 reservation_expired`` inside the same transaction, so no renewal
+    record is written and ``expires_at`` is never moved for a dead
+    reservation.
+    """
     async with _write_lock():
         async with db.connect() as conn:
             await db.begin_immediate(conn)
+            # Judge TTL against the instant the write transaction actually
+            # starts, never an instant sampled before lock queueing.
+            now_iso = utcnow().isoformat()
             try:
                 await db.require_dataset(conn, dataset_id)
 
